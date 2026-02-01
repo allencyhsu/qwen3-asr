@@ -19,6 +19,7 @@ import argparse
 import gc
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -59,6 +60,90 @@ DEFAULT_CHUNK_DURATION = 300
 
 # Overlap between chunks in seconds
 CHUNK_OVERLAP = 1
+
+# Default pause threshold for merging timestamps (seconds)
+DEFAULT_PAUSE_THRESHOLD = 0.5
+
+# Sentence-ending punctuation for timestamp merging
+SENTENCE_END_PUNCTUATION = set('。！？.!?')
+CLAUSE_PUNCTUATION = set('，,；;：:')
+
+
+def merge_timestamps(
+    timestamps: List[dict],
+    pause_threshold: float = DEFAULT_PAUSE_THRESHOLD,
+) -> List[dict]:
+    """
+    Merge character-level timestamps into sentence-level timestamps.
+    
+    Merges consecutive timestamps based on:
+    1. Pause detection: Gap > pause_threshold starts new sentence
+    2. Punctuation: Sentence-ending punctuation (。！？.!?) starts new sentence
+    
+    Args:
+        timestamps: List of dicts with 'text', 'start', 'end' keys
+        pause_threshold: Gap in seconds to trigger new sentence (default: 0.5)
+        
+    Returns:
+        List of merged timestamp dicts
+    """
+    if not timestamps:
+        return []
+    
+    merged = []
+    current_texts = []
+    current_start = timestamps[0]['start']
+    current_end = timestamps[0]['end']
+    
+    for i, ts in enumerate(timestamps):
+        text = ts['text']
+        start = ts['start']
+        end = ts['end']
+        
+        # Check if we should start a new sentence
+        should_split = False
+        
+        if i > 0:
+            # Check for pause (gap between previous end and current start)
+            gap = start - current_end
+            if gap > pause_threshold:
+                should_split = True
+        
+        if should_split and current_texts:
+            # Save current sentence
+            merged.append({
+                'text': ''.join(current_texts),
+                'start': current_start,
+                'end': current_end,
+            })
+            # Start new sentence
+            current_texts = []
+            current_start = start
+        
+        # Add current character/word
+        current_texts.append(text)
+        current_end = end
+        
+        # Check for sentence-ending punctuation
+        if text and text[-1] in SENTENCE_END_PUNCTUATION:
+            merged.append({
+                'text': ''.join(current_texts),
+                'start': current_start,
+                'end': current_end,
+            })
+            current_texts = []
+            if i + 1 < len(timestamps):
+                current_start = timestamps[i + 1]['start']
+    
+    # Don't forget the last sentence
+    if current_texts:
+        merged.append({
+            'text': ''.join(current_texts),
+            'start': current_start,
+            'end': current_end,
+        })
+    
+    return merged
 
 
 def load_audio(file_path: str) -> Tuple[np.ndarray, int]:
@@ -231,6 +316,7 @@ def transcribe_audio_chunked(
     language: Optional[str] = None,
     return_timestamps: bool = False,
     chunk_duration: float = DEFAULT_CHUNK_DURATION,
+    merge_ts: bool = False,
 ) -> str:
     """
     Transcribe audio with chunking for long files.
@@ -258,14 +344,18 @@ def transcribe_audio_chunked(
     
     for i, (chunk_data, start_time) in enumerate(chunks):
         chunk_duration_actual = len(chunk_data) / sample_rate
-        print(f"  Chunk {i+1}/{len(chunks)}: {start_time:.1f}s - {start_time + chunk_duration_actual:.1f}s")
+        print(f"  Chunk {i+1}/{len(chunks)}: {start_time:.1f}s - {start_time + chunk_duration_actual:.1f}s", end="")
         
         try:
+            chunk_start_time = time.time()
             results = model.transcribe(
                 audio=(chunk_data, sample_rate),
                 language=language,
                 return_time_stamps=return_timestamps,
             )
+            chunk_elapsed = time.time() - chunk_start_time
+            rtf = chunk_elapsed / chunk_duration_actual if chunk_duration_actual > 0 else 0
+            print(f" → {chunk_elapsed:.1f}s (RTF: {rtf:.2f}x)")
             
             for result in results:
                 if result.text:
@@ -289,6 +379,10 @@ def transcribe_audio_chunked(
             print(f"    Error in chunk {i+1}: {e}")
             continue
     
+    # Merge timestamps into sentences (based on pauses and punctuation)
+    if all_timestamps and merge_ts:
+        all_timestamps = merge_timestamps(all_timestamps)
+    
     return " ".join(all_text), all_timestamps
 
 
@@ -300,8 +394,14 @@ def transcribe_files(
     chunk_duration: float = DEFAULT_CHUNK_DURATION,
     output_file: Optional[str] = None,
     convert_traditional: bool = False,
+    auto_save: bool = False,
+    merge_ts: bool = False,
+    quiet: bool = False,
 ) -> None:
-    """Transcribe multiple audio files and print/save results."""
+    """Transcribe multiple audio files and print/save results.
+    
+    If auto_save is True, save transcription to .txt file with same name as audio file.
+    """
     
     output_lines = []
     
@@ -319,6 +419,9 @@ def transcribe_files(
             print(info)
             output_lines.append(info)
             
+            # Start timing
+            file_start_time = time.time()
+            
             # Transcribe with chunking
             text, timestamps = transcribe_audio_chunked(
                 model=model,
@@ -327,6 +430,7 @@ def transcribe_files(
                 language=language,
                 return_timestamps=return_timestamps,
                 chunk_duration=chunk_duration,
+                merge_ts=merge_ts,
             )
             
             # Convert to Traditional Chinese if requested
@@ -336,18 +440,39 @@ def transcribe_files(
                     for ts in timestamps:
                         ts['text'] = convert_to_traditional(ts['text'])
             
-            # Print results
-            print(f"\nTranscription:")
-            print(text)
+            # Print results (unless quiet mode)
+            if not quiet:
+                print(f"\nTranscription:")
+                print(text)
             output_lines.append(f"\nTranscription:\n{text}")
             
             if return_timestamps and timestamps:
-                print("\nTimestamps:")
+                if not quiet:
+                    print("\nTimestamps:")
                 output_lines.append("\nTimestamps:")
                 for ts in timestamps:
                     ts_line = f"  [{ts['start']:.2f}s - {ts['end']:.2f}s] {ts['text']}"
-                    print(ts_line)
+                    if not quiet:
+                        print(ts_line)
                     output_lines.append(ts_line)
+            
+            # Auto-save to .txt file with same name as audio
+            if auto_save:
+                txt_path = file_path.parent / f"{file_path.stem}_qwen3.txt"
+                with open(txt_path, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                    if return_timestamps and timestamps:
+                        f.write('\n\nTimestamps:\n')
+                        for ts in timestamps:
+                            f.write(f"[{ts['start']:.2f}s - {ts['end']:.2f}s] {ts['text']}\n")
+                print(f"\nSaved to: {txt_path}")
+            
+            # Print total time for this file
+            file_elapsed = time.time() - file_start_time
+            file_rtf = file_elapsed / duration if duration > 0 else 0
+            time_info = f"\nTotal processing time: {file_elapsed:.1f}s (Audio: {duration:.1f}s, RTF: {file_rtf:.2f}x)"
+            print(time_info)
+            output_lines.append(time_info)
                         
         except Exception as e:
             error_msg = f"Error processing {file_path}: {e}"
@@ -393,7 +518,12 @@ Examples:
     parser.add_argument(
         "--timestamps", "-t",
         action="store_true",
-        help="Return word-level timestamps"
+        help="Return character/word-level timestamps (raw, very detailed)"
+    )
+    parser.add_argument(
+        "--merge-timestamps", "-mt",
+        action="store_true",
+        help="Merge timestamps into sentences (requires --timestamps)"
     )
     parser.add_argument(
         "--model", "-m",
@@ -417,6 +547,16 @@ Examples:
         "--traditional", "-tw",
         action="store_true",
         help="Convert output to Traditional Chinese (zh_TW)"
+    )
+    parser.add_argument(
+        "--save", "-s",
+        action="store_true",
+        help="Auto-save transcription to .txt file with same name as audio"
+    )
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress transcription output (still saves to file with -s)"
     )
     
     args = parser.parse_args()
@@ -462,6 +602,9 @@ Examples:
         chunk_duration=args.chunk_duration,
         output_file=args.output,
         convert_traditional=args.traditional,
+        auto_save=args.save,
+        merge_ts=args.merge_timestamps,
+        quiet=args.quiet,
     )
     
     print("\n" + "="*60)
