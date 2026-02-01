@@ -273,17 +273,19 @@ def split_audio_into_chunks(
 def create_asr_model(
     model_path: Optional[str] = None,
     use_timestamps: bool = False,
+    model_size: str = "1.7B",
 ) -> Qwen3ASRModel:
     """Create and return the ASR model."""
     
     # Determine model path
     if model_path is None:
+        model_name = f"Qwen3-ASR-{model_size}"
         # Check for local model first
-        local_model = Path("./Qwen3-ASR-1.7B")
+        local_model = Path(f"./{model_name}")
         if local_model.exists():
             model_path = str(local_model)
         else:
-            model_path = "Qwen/Qwen3-ASR-1.7B"
+            model_path = f"Qwen/{model_name}"
     
     print(f"Loading ASR model from: {model_path}")
     
@@ -397,6 +399,7 @@ def transcribe_files(
     auto_save: bool = False,
     merge_ts: bool = False,
     quiet: bool = False,
+    suffix: str = "_qwen3",
 ) -> None:
     """Transcribe multiple audio files and print/save results.
     
@@ -458,7 +461,7 @@ def transcribe_files(
             
             # Auto-save to .txt file with same name as audio
             if auto_save:
-                txt_path = file_path.parent / f"{file_path.stem}_qwen3.txt"
+                txt_path = file_path.parent / f"{file_path.stem}{suffix}.txt"
                 with open(txt_path, 'w', encoding='utf-8') as f:
                     f.write(text)
                     if return_timestamps and timestamps:
@@ -529,7 +532,14 @@ Examples:
         "--model", "-m",
         type=str,
         default=None,
-        help="Path to ASR model (default: ./Qwen3-ASR-1.7B or Qwen/Qwen3-ASR-1.7B)"
+        help="Path to ASR model (overrides --model-size)"
+    )
+    parser.add_argument(
+        "--model-size",
+        type=str,
+        choices=["1.7B", "0.6B"],
+        default="1.7B",
+        help="Model size: 1.7B (default) or 0.6B"
     )
     parser.add_argument(
         "--chunk-duration", "-c",
@@ -557,6 +567,12 @@ Examples:
         "--quiet", "-q",
         action="store_true",
         help="Suppress transcription output (still saves to file with -s)"
+    )
+    parser.add_argument(
+        "--suffix",
+        type=str,
+        default="_qwen3",
+        help="Output filename suffix (default: _qwen3)"
     )
     
     args = parser.parse_args()
@@ -591,6 +607,7 @@ Examples:
     model = create_asr_model(
         model_path=args.model,
         use_timestamps=args.timestamps,
+        model_size=args.model_size,
     )
     
     # Transcribe
@@ -605,6 +622,7 @@ Examples:
         auto_save=args.save,
         merge_ts=args.merge_timestamps,
         quiet=args.quiet,
+        suffix=args.suffix,
     )
     
     print("\n" + "="*60)
